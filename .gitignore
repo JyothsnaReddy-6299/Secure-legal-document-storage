@@ -1,0 +1,23 @@
+# Python & Virtual Environments
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node & Frontend
+node_modules/
+dist/
+build/
+.vite/
+
+# Database & Environment Secrets
+.env
+*.db
+*.sqlite3
+
+# Uploads & Cache
+backend/uploads/*
+!backend/uploads/.gitkeep
+.DS_Store
+Thumbs.db
