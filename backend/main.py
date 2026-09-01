@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import os
@@ -24,10 +25,37 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 
+# Default Credential Registry for Prototype Demonstration
+DEFAULT_USERS = {
+    "CONSTABLE101": {"password": "police123", "name": "Constable Rajesh Kumar", "role": "constable", "title": "Police Station Officer"},
+    "IO202": {"password": "io123", "name": "Inspector Amit Sharma", "role": "io", "title": "Investigating Officer (IO)"},
+    "FSL303": {"password": "fsl123", "name": "Dr. V. K. Verma", "role": "fsl", "title": "Forensic Science Lab Expert"},
+    "JUDGE404": {"password": "judge123", "name": "Hon'ble Judge S. K. Gupta", "role": "judge", "title": "Courtroom Judicial Officer"}
+}
+
 @app.on_event("startup")
 def startup():
     models.Base.metadata.create_all(bind=engine)
     os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# ----------------- AUTHENTICATION -----------------
+
+@app.post("/api/login")
+def login(badge_id: str = Form(...), password: str = Form(...)):
+    badge_clean = badge_id.strip().upper()
+    user = DEFAULT_USERS.get(badge_clean)
+    
+    if not user or user["password"] != password.strip():
+        raise HTTPException(status_code=401, detail="Invalid Badge ID / Username or Password.")
+        
+    return {
+        "success": True,
+        "badge_id": badge_clean,
+        "name": user["name"],
+        "role": user["role"],
+        "title": user["title"],
+        "token": f"TOKEN-{badge_clean}-{datetime.datetime.utcnow().timestamp()}"
+    }
 
 # ----------------- STAGE 1: CASES & DOCUMENTS -----------------
 
@@ -87,14 +115,12 @@ def create_case(
     db.refresh(new_case)
     return new_case
 
-# Delete a case and all its associated documents & evidence from the database
 @app.delete("/api/cases/{case_id}")
 def delete_case(case_id: int, db: Session = Depends(get_db)):
     case = db.query(models.Case).filter(models.Case.id == case_id).first()
     if not case:
         raise HTTPException(status_code=404, detail="Case not found in database.")
     
-    # Optionally delete physical files from uploads folder
     for doc in case.documents:
         if doc.file_path and os.path.exists(doc.file_path):
             try:
@@ -106,6 +132,30 @@ def delete_case(case_id: int, db: Session = Depends(get_db)):
     db.delete(case)
     db.commit()
     return {"message": f"Case '{case_no}' and its associated records have been permanently deleted from the database."}
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: int, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document file not found in database.")
+        
+    doc_title = doc.title
+    if doc.file_path and os.path.exists(doc.file_path):
+        try:
+            os.remove(doc.file_path)
+        except Exception:
+            pass
+            
+    db.delete(doc)
+    db.commit()
+    return {"message": f"Document '{doc_title}' permanently deleted from database and file store."}
+
+@app.get("/api/documents/{doc_id}/file")
+def get_document_file(doc_id: int, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc or not doc.file_path or not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=404, detail="Original document file not found on disk.")
+    return FileResponse(doc.file_path)
 
 @app.post("/api/documents/upload")
 async def upload_document(
@@ -121,7 +171,6 @@ async def upload_document(
     file_bytes = await file.read()
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     
-    # Text Extraction Pipeline (PDF & TXT)
     extracted_text = ""
     filename_lower = file.filename.lower()
     
@@ -135,23 +184,48 @@ async def upload_document(
                 if txt:
                     page_texts.append(txt.strip())
             extracted_text = "\n\n".join(page_texts)
+
+            # If PDF has no text layer (scanned PDF), try RapidOCR
+            if not extracted_text.strip():
+                try:
+                    import sys
+                    sys.path.append(r'C:\Users\BHASKAR REDDY ANDAY\AppData\Roaming\Python\Python314\site-packages')
+                    from rapidocr_onnxruntime import RapidOCR
+                    ocr_engine = RapidOCR()
+                    ocr_res, _ = ocr_engine(file_bytes)
+                    if ocr_res:
+                        extracted_text = "\n".join([line[1] for line in ocr_res])
+                except Exception as ocr_err:
+                    print(f"Scanned PDF OCR Fallback Notice: {ocr_err}")
+
         elif filename_lower.endswith((".txt", ".csv", ".json", ".log")):
             extracted_text = file_bytes.decode('utf-8', errors='ignore')
+        elif filename_lower.endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")):
+            try:
+                import sys
+                sys.path.append(r'C:\Users\BHASKAR REDDY ANDAY\AppData\Roaming\Python\Python314\site-packages')
+                from rapidocr_onnxruntime import RapidOCR
+                ocr_engine = RapidOCR()
+                ocr_res, _ = ocr_engine(file_bytes)
+                if ocr_res:
+                    extracted_text = "\n".join([line[1] for line in ocr_res])
+                else:
+                    extracted_text = f"Image: {file.filename} (OCR completed, no text detected in image)."
+            except Exception as ocr_err:
+                extracted_text = f"Image: {file.filename} (OCR engine error: {ocr_err})"
         else:
-            extracted_text = f"[Binary/Image File: {file.filename} - Uploaded and SHA-256 hashed successfully]"
+            extracted_text = f"[Binary File: {file.filename} - Uploaded and SHA-256 hashed successfully]"
     except Exception as e:
         extracted_text = f"[Text parsing error: {e}]"
         
     if not extracted_text.strip():
-        extracted_text = f"File: {file.filename} (Uploaded successfully, no embedded text layer found)."
+        extracted_text = f"File: {file.filename} (Uploaded successfully, no readable text found)."
 
-    # Save physical file to uploads/ directory
     os.makedirs(UPLOADS_DIR, exist_ok=True)
     file_path = os.path.join(UPLOADS_DIR, file.filename)
     with open(file_path, "wb") as f:
         f.write(file_bytes)
         
-    # Save record to Database
     new_doc = models.Document(
         case_id=case_id,
         title=title.strip(),
